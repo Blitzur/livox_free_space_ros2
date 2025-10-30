@@ -18,13 +18,16 @@
 #include "pcl/PCLPointCloud2.h"
 #include "FreeSpace.hpp"
 #include <pcl/filters/approximate_voxel_grid.h>
+#include <patchwork/patchworkpp.h>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+
 
 
 class LivoxFreeSpace : public rclcpp::Node {
 public:
     LivoxFreeSpace() : Node("livox_freespace_ros2_port") {
 
-        height_offset = this->declare_parameter("height_offset", 0.3);
+        height_offset = this->declare_parameter("height_offset", 0.5);
 
         //////////////////////  Publisher //////////////////////
         /// Visually debugging
@@ -32,6 +35,8 @@ public:
         fs_distance_text_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("fs_marker/dis_text", 1);
         fs_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("fs_pointcloud/pointcloud", 1);
         fs_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("/fs_pointcloud/free_space", 1);
+        ground_points_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("/fs_pointcloud/ground_points", 1);
+
 
         //////////////////////  Subscribers //////////////////////
         //currently we use the mpc_deg for speeds under 30km/h and the ftc_deg for speeds 30+ in future we would like to only use the mpc_deg!
@@ -42,12 +47,15 @@ public:
 
 private:
     //general
+    std::shared_ptr<patchwork::PatchWorkpp> patchwork_;
     unsigned char *pVImg;
     std::string namesp;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr fs_distance_circle_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr fs_distance_text_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr fs_points_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr fs_pub;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr ground_points_pub;
+
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pc;
     std::vector<sensor_msgs::msg::PointCloud2> recieved_pc_msgs;
     sensor_msgs::msg::PointCloud2 this_pc_msg;
@@ -80,6 +88,28 @@ private:
         is_background_pub = true;
         fs_distance_circle_pub->publish(circles);
         fs_distance_text_pub->publish(texts);
+
+        // Parameter für Patchwork++
+        patchwork::Params params;
+        params.verbose = false;
+
+        // Wichtige Parameter für steile Rampen
+        params.uprightness_thr = 0.5;  // Weniger strikt (default: 0.707)
+        params.adaptive_seed_selection_margin = -1.2;  // Besser für Steigungen
+        params.num_iter = 3;
+        params.num_lpr = 20;
+        params.num_min_pts = 10;
+        params.th_seeds = 0.3;  // Seed threshold
+        params.th_dist = 0.3;   // Distance threshold
+        params.max_range = 50.0;
+        params.min_range = 0.0;
+        params.num_zones = 4;   // Konzentrische Zonen
+        params.num_rings_each_zone = {2, 4, 4, 4};
+        params.num_sectors_each_zone = {16, 32, 54, 32};
+        params.elevation_thr = {0, 0, 0, 0};
+        params.flatness_thr = {0, 0, 0, 0};
+
+        patchwork_ = std::make_shared<patchwork::PatchWorkpp>(params);
     }
 
     void PointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg) {
@@ -87,14 +117,15 @@ private:
         pcl::PointCloud<pcl::PointXYZI>::Ptr pc(new pcl::PointCloud<pcl::PointXYZI>());
         pcl::fromROSMsg(*cloud_msg, *pc);
 
+        /**
         pcl::PointCloud<pcl::PointXYZI>::Ptr rotated_cloud(new pcl::PointCloud<pcl::PointXYZI>());
         // Rotationsmatrix um Y-Achse erstellen
         float angle = 45.0 * M_PI / 180.0;  // 45 Grad in Radianten
         Eigen::Affine3f transform = Eigen::Affine3f::Identity();
         transform.rotate(Eigen::AngleAxisf(angle, Eigen::Vector3f::UnitY()));
-
         // Anwenden
         pcl::transformPointCloud(*pc, *rotated_cloud, transform);
+        */
 
         for (int i = 0; i < pc->points.size(); i++) {
             pc->points[i].z = pc->points[i].z + height_offset;
@@ -107,20 +138,59 @@ private:
         //avg.setLeafSize(0.5f, 0.5f, 0.5f);
         //avg.filter(*cloud_filtered);
         auto start2 = std::chrono::high_resolution_clock::now();
-
         //std::cout << "Downsampled: " << pc->size() << " → " << cloud_filtered->size() << " Punkte" << std::endl;
-        //pc = cloud_filtered;
+        auto eigenDonwsamplePC = pclToEigen(pc);
 
+        // Patchwork++ Ground Segmentation
+        pcl::PointCloud<pcl::PointXYZI>::Ptr ground_cloud(new pcl::PointCloud<pcl::PointXYZI>());
+        pcl::PointCloud<pcl::PointXYZI>::Ptr nonground_cloud(new pcl::PointCloud<pcl::PointXYZI>());
+
+        //patchwork_->estimateGround(pointCloud2ToEigen(cloud_msg));
+        patchwork_->estimateGround(eigenDonwsamplePC);
+        auto non_grounds = patchwork_->getNonground();
+        auto grounds = patchwork_->getGround();
+
+        std::cout << "Patchwork++: Ground=" << non_grounds.size()
+                  << ", NonGround=" << grounds.size() << std::endl;
+
+
+        // FreeSpace nur mit Non-Ground Punkten berechnen
+        GenerateFreeSpaceWithPatchwork(*eigenToPCL(non_grounds));
+
+        // Ground Points publishen
+        ground_points_pub->publish(eigenToRosMsg(grounds, "lidar/fm"));
+        fs_points_pub->publish(eigenToRosMsg(non_grounds, "lidar/fm"));
+
+        /**
         gheader = cloud_msg->header;
         GenerateFreeSpace(*pc);
-
+        */
         std::cout << "Recieved pointcloud: secs = " << cloud_msg->header.stamp.sec << ", nsecs = " << cloud_msg->header.stamp.nanosec << std::endl;
-        //this_pc_msg = cloud_msg;
-        this_pc_msg = *cloud_msg;
         double duration0 = std::chrono::duration_cast<std::chrono::milliseconds>(start1 - start0).count() / 1000.0;
         double duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(start2 - start1).count() / 1000.0;
         std::cout << "time transform to PCL and change z: secs = " << duration0
         << "\npcl downsample: secs = " << duration1 << std::endl;
+    }
+
+    Eigen::MatrixXf pointCloud2ToEigen(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg) {
+        // Anzahl der Punkte
+        size_t n_points = cloud_msg->width * cloud_msg->height;
+
+        // Matrix mit 3 Spalten (x,y,z)
+        Eigen::MatrixXf points(n_points, 3);
+
+        // Iteratoren für x, y, z
+        sensor_msgs::PointCloud2ConstIterator<float> iter_x(*cloud_msg, "x");
+        sensor_msgs::PointCloud2ConstIterator<float> iter_y(*cloud_msg, "y");
+        sensor_msgs::PointCloud2ConstIterator<float> iter_z(*cloud_msg, "z");
+
+        for (size_t i = 0; i < n_points; ++i, ++iter_x, ++iter_y, ++iter_z) {
+            points(i, 0) = *iter_x;
+            points(i, 1) = *iter_y;
+            points(i, 2) = *iter_z;
+        }
+
+        return points;
     }
 
     void PrepareBackground() {
@@ -339,6 +409,24 @@ private:
         int *pLabelGnd = (int *) calloc(pntNum, sizeof(int));
         int ground_point_num = GroundSegment(pLabelGnd, fPoints2, pntNum, 1.0);
 
+        pcl::PointCloud<pcl::PointXYZI> ground_cloud;
+        ground_cloud.clear();
+        for (int i = 0; i < pntNum; i++) {
+            if (pLabelGnd[i] == 1) {  // 1 = Ground
+                pcl::PointXYZI p;
+                p.x = fPoints2[i * 4];
+                p.y = fPoints2[i * 4 + 1];
+                p.z = fPoints2[i * 4 + 2];
+                p.intensity = fPoints2[i * 4 + 3];
+                ground_cloud.points.push_back(p);
+            }
+        }
+        sensor_msgs::msg::PointCloud2 ground_msg;
+        pcl::toROSMsg(ground_cloud, ground_msg);
+        ground_msg.header.stamp = gheader.stamp;
+        ground_msg.header.frame_id = "lidar/fm";
+        ground_points_pub->publish(ground_msg);
+
         // Freespace
         auto start2 = std::chrono::high_resolution_clock::now();
         int agnum = pntNum - ground_point_num;
@@ -373,6 +461,106 @@ private:
         double duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(start2 - start1).count() / 1000.0;
         double duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(start3 - start2).count() / 1000.0;
         printf("Downsample: %f, Ground Segment: %f, FreeSpace: %f\n\n", duration0, duration1, duration2);
+    }
+
+    void GenerateFreeSpaceWithPatchwork(pcl::PointCloud<pcl::PointXYZI> &nonground) {
+        int dnum = nonground.points.size();
+        float *data = (float *) calloc(dnum * 4, sizeof(float));
+        std::vector<float> free_space;
+
+        for (int p = 0; p < dnum; ++p) {
+            data[p * 4 + 0] = nonground.points[p].x;
+            data[p * 4 + 1] = nonground.points[p].y;
+            data[p * 4 + 2] = nonground.points[p].z;
+            data[p * 4 + 3] = nonground.points[p].intensity;
+        }
+
+        // Jetzt direkt FreeSpace ohne Ground-Segmentation
+        float *free_space_small = (float *) calloc(360, sizeof(float));
+        this->FreeSpace(data, dnum, free_space_small, 360);
+        this->FreeSpaceFilter(free_space_small, 360, free_space);
+
+        // Publishen...
+        pcl::PointCloud<pcl::PointXYZI> fs;
+        fs.clear();
+        for (int i = 0; i < free_space.size(); i += 3) {
+            pcl::PointXYZI p;
+            p.x = free_space[i];
+            p.y = free_space[i + 1];
+            p.z = 0;
+            p.intensity = free_space[i + 2];
+            fs.points.push_back(p);
+        }
+        sensor_msgs::msg::PointCloud2 msg3;
+        pcl::toROSMsg(fs, msg3);
+        msg3.header.stamp = gheader.stamp;
+        msg3.header.frame_id = "lidar/fm";
+        fs_pub->publish(msg3);
+
+        free(data);
+        free(free_space_small);
+    }
+
+    sensor_msgs::msg::PointCloud2 eigenToRosMsg(const Eigen::MatrixXf& mat, const std::string& frame_id = "map")
+    {
+        // 1️⃣ Eigen → PCL
+        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>);
+        cloud->width    = mat.rows();
+        cloud->height   = 1;
+        cloud->is_dense = false;
+        cloud->points.resize(mat.rows());
+
+        for (int i = 0; i < mat.rows(); ++i) {
+            pcl::PointXYZI pt;
+            pt.x = mat(i, 0);
+            pt.y = mat(i, 1);
+            pt.z = mat(i, 2);
+            pt.intensity = (mat.cols() > 3) ? mat(i, 3) : 0.0f;
+            cloud->points[i] = pt;
+        }
+
+        // 2️⃣ PCL → ROS2-Message
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*cloud, msg);
+        msg.header.stamp = rclcpp::Clock().now();
+        msg.header.frame_id = frame_id;
+        return msg;
+    }
+
+    Eigen::MatrixXf pclToEigen(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud)
+    {
+        Eigen::MatrixXf mat(cloud->points.size(), 4); // x, y, z, intensity
+
+        for (size_t i = 0; i < cloud->points.size(); ++i)
+        {
+            const auto& pt = cloud->points[i];
+            mat(i, 0) = pt.x;
+            mat(i, 1) = pt.y;
+            mat(i, 2) = pt.z;
+            mat(i, 3) = pt.intensity;
+        }
+
+        return mat;
+    }
+
+    pcl::PointCloud<pcl::PointXYZI>::Ptr eigenToPCL(const Eigen::MatrixXf& mat) {
+        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>);
+
+        cloud->width    = mat.rows();
+        cloud->height   = 1;
+        cloud->is_dense = false;
+        cloud->points.resize(mat.rows());
+
+        for (int i = 0; i < mat.rows(); ++i) {
+            pcl::PointXYZI pt;
+            pt.x = mat(i, 0);
+            pt.y = mat(i, 1);
+            pt.z = mat(i, 2);
+            pt.intensity = 0.0f; // oder beliebiger Defaultwert
+            cloud->points[i] = pt;
+        }
+
+        return cloud;
     }
 
     void FreeSpaceFilter(float *free_space_small, int n, std::vector<float> &free_space) {
