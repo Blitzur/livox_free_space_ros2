@@ -17,12 +17,14 @@
 #include <memory.h>
 #include "pcl/PCLPointCloud2.h"
 #include "FreeSpace.hpp"
+#include <pcl/filters/approximate_voxel_grid.h>
+
 
 class LivoxFreeSpace : public rclcpp::Node {
 public:
     LivoxFreeSpace() : Node("livox_freespace_ros2_port") {
 
-        height_offset = this->declare_parameter("height_offset", 0.7);
+        height_offset = this->declare_parameter("height_offset", 0.3);
 
         //////////////////////  Publisher //////////////////////
         /// Visually debugging
@@ -81,18 +83,44 @@ private:
     }
 
     void PointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg) {
-        pcl::PointCloud<pcl::PointXYZI> pc;
+        auto start0 = std::chrono::high_resolution_clock::now();
+        pcl::PointCloud<pcl::PointXYZI>::Ptr pc(new pcl::PointCloud<pcl::PointXYZI>());
+        pcl::fromROSMsg(*cloud_msg, *pc);
 
-        pcl::fromROSMsg(*cloud_msg, pc);
-        for (int i = 0; i < pc.points.size(); i++) {
-            pc.points[i].z = pc.points[i].z + height_offset;
+        pcl::PointCloud<pcl::PointXYZI>::Ptr rotated_cloud(new pcl::PointCloud<pcl::PointXYZI>());
+        // Rotationsmatrix um Y-Achse erstellen
+        float angle = 45.0 * M_PI / 180.0;  // 45 Grad in Radianten
+        Eigen::Affine3f transform = Eigen::Affine3f::Identity();
+        transform.rotate(Eigen::AngleAxisf(angle, Eigen::Vector3f::UnitY()));
+
+        // Anwenden
+        pcl::transformPointCloud(*pc, *rotated_cloud, transform);
+
+        for (int i = 0; i < pc->points.size(); i++) {
+            pc->points[i].z = pc->points[i].z + height_offset;
+            pc->points[i].x -= 2.7;
         }
+        auto start1 = std::chrono::high_resolution_clock::now();
+        //pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZI>());
+        //pcl::ApproximateVoxelGrid<pcl::PointXYZI> avg;
+        //avg.setInputCloud(pc);
+        //avg.setLeafSize(0.5f, 0.5f, 0.5f);
+        //avg.filter(*cloud_filtered);
+        auto start2 = std::chrono::high_resolution_clock::now();
+
+        //std::cout << "Downsampled: " << pc->size() << " → " << cloud_filtered->size() << " Punkte" << std::endl;
+        //pc = cloud_filtered;
+
         gheader = cloud_msg->header;
-        GenerateFreeSpace(pc);
+        GenerateFreeSpace(*pc);
 
         std::cout << "Recieved pointcloud: secs = " << cloud_msg->header.stamp.sec << ", nsecs = " << cloud_msg->header.stamp.nanosec << std::endl;
         //this_pc_msg = cloud_msg;
         this_pc_msg = *cloud_msg;
+        double duration0 = std::chrono::duration_cast<std::chrono::milliseconds>(start1 - start0).count() / 1000.0;
+        double duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(start2 - start1).count() / 1000.0;
+        std::cout << "time transform to PCL and change z: secs = " << duration0
+        << "\npcl downsample: secs = " << duration1 << std::endl;
     }
 
     void PrepareBackground() {
@@ -190,9 +218,7 @@ private:
     }
 
     void GenerateFreeSpace(pcl::PointCloud<pcl::PointXYZI> &pc) {
-        clock_t t0, t1, t2;
-        t0 = clock();
-
+        auto start0 = std::chrono::high_resolution_clock::now();
         int dnum = pc.points.size();
         std::cout << "Point cloud size: " << dnum << std::endl;
 
@@ -205,8 +231,8 @@ private:
             data[p * 4 + 3] = pc.points[p].intensity;
         }
         GenerateFreeSpace(data, dnum, free_space);
-        t1 = clock();
 
+        auto start1 = std::chrono::high_resolution_clock::now();
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
         cloud->clear();
         cloud->width = dnum;
@@ -238,31 +264,28 @@ private:
         msg3.header.frame_id = "lidar/fm";
         fs_pub->publish(msg3);
         std::vector<float>().swap(free_space);
-        t2 = clock();
+        auto start2 = std::chrono::high_resolution_clock::now();
 
-        printf("\n\n");
-        printf("Total Time: %f, FreeSpace: %f, Publish Results: %f\n\n",
-               1000.0 * (t2 - t0) / CLOCKS_PER_SEC, 1000.0 * (t1 - t0) / CLOCKS_PER_SEC,
-               1000.0 * (t2 - t1) / CLOCKS_PER_SEC);
+        double duration0 = std::chrono::duration_cast<std::chrono::milliseconds>(start1 - start0).count() / 1000.0;
+        double duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(start2 - start1).count() / 1000.0;
+        double duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(start2 - start0).count() / 1000.0;
+        printf("Total Time: %f, FreeSpace: %f, Publish Results: %f\n\n", duration2, duration0, duration1);
         printf("---------------------------------------------\n\n");
         free(data);
     }
 
     int GenerateFreeSpace(float *fPoints1, int pointNum, std::vector<float> &free_space) {
-        clock_t t0, t1, t2, t3, t4;
-        t0 = clock();
+
         // down sampling
+        auto start0 = std::chrono::high_resolution_clock::now();
         float *fPoints2 = (float *) calloc(pointNum * 4, sizeof(float));
         int *idtrans1 = (int *) calloc(pointNum, sizeof(int));
         int *idtransx = (int *) calloc(pointNum, sizeof(int));
         int *idtransy = (int *) calloc(pointNum, sizeof(int));
         int *idtrans2 = (int *) calloc(pointNum, sizeof(int));
-
         int pntNum = 0;
-
-        pVImg = (unsigned char *) calloc(DN_SAMPLE_IMG_NX * DN_SAMPLE_IMG_NY * DN_SAMPLE_IMG_NZ,
-                                                        sizeof(unsigned char));
-        std::vector<int> count(DENOISE_IMG_NX * DENOISE_IMG_NY * DENOISE_IMG_NZ, 0);
+        pVImg = (unsigned char *) calloc(DN_SAMPLE_IMG_NX * DN_SAMPLE_IMG_NY * DN_SAMPLE_IMG_NZ, sizeof(unsigned char));
+        std::vector count(DENOISE_IMG_NX * DENOISE_IMG_NY * DENOISE_IMG_NZ, 0);
 
         for (int pid = 0; pid < pointNum; pid++) {
             int ix = (fPoints1[pid * 4] + DN_SAMPLE_IMG_OFFX) / DENOISE_IMG_DX;
@@ -310,13 +333,14 @@ private:
             }
         }
 
-        t1 = clock();
+        // Ground Segment
+        auto start1 = std::chrono::high_resolution_clock::now();
 
         int *pLabelGnd = (int *) calloc(pntNum, sizeof(int));
         int ground_point_num = GroundSegment(pLabelGnd, fPoints2, pntNum, 1.0);
 
-        t2 = clock();
-
+        // Freespace
+        auto start2 = std::chrono::high_resolution_clock::now();
         int agnum = pntNum - ground_point_num;
         float *fPoints3 = (float *) calloc(agnum * 4, sizeof(float));
         int agcnt = 0;
@@ -343,48 +367,19 @@ private:
         free(this->pVImg);
         free(free_space_small);
         std::vector<int>().swap(count);
-        t3 = clock();
-        // printf("FreeSpace total Time: %f, Downsample: %f, Ground Segment: %f, FreeSpace: %f\n\n", 1000.0*(t3 - t0) / CLOCKS_PER_SEC,
-        //         1000.0*(t1 - t0) / CLOCKS_PER_SEC, 1000.0*(t2 - t1) / CLOCKS_PER_SEC, 1000.0*(t3 - t2) / CLOCKS_PER_SEC);
+        auto start3 = std::chrono::high_resolution_clock::now();
+
+        double duration0 = std::chrono::duration_cast<std::chrono::milliseconds>(start1 - start0).count() / 1000.0;
+        double duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(start2 - start1).count() / 1000.0;
+        double duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(start3 - start2).count() / 1000.0;
+        printf("Downsample: %f, Ground Segment: %f, FreeSpace: %f\n\n", duration0, duration1, duration2);
     }
 
-    int filter_x[28] = {
-        -1, 0, 1, -3, -2, 2, 3, -4, 4, -4, 4, -5, 5, -5, 5, -5, 5, -1, 0, 1, -3, -2, 2, 3, -4, 4, -4, 4
-    };
-    int filter_y[28] = {
-        -5, -5, -5, -4, -4, -4, -4, -3, -3, -2, -2, -1, -1, 0, 0, 1, 1, 5, 5, 5, 4, 4, 4, 4, 3, 3, 2, 2
-    };
-    int all_x[89] = {
-        -1, 0, 1,
-        -3, -2, -1, 0, 1, 2, 3,
-        -4, -3, -2, -1, 0, 1, 2, 3, 4,
-        -4, -3, -2, -1, 0, 1, 2, 3, 4,
-        -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
-        -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
-        -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
-        -1, 0, 1,
-        -3, -2 - 1, 0, 1, 2, 3,
-        -4, -3, -2, -1, 0, 1, 2, 3, 4,
-        -4, -3, -2, -1, 0, 1, 2, 3, 4
-    };
-    int all_y[89] = {
-        -5, -5, -5,
-        -4, -4, -4, -4, -4, -4, -4,
-        -3, -3, -3, -3, -3, -3, -3, -3, -3,
-        -2, -2, -2, -2, -2, -2, -2, -2, -2,
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        5, 5, 5,
-        4, 4, 4, 4, 4, 4, 4,
-        3, 3, 3, 3, 3, 3, 3, 3, 3,
-        2, 2, 2, 2, 2, 2, 2, 2, 2
-    };
-
     void FreeSpaceFilter(float *free_space_small, int n, std::vector<float> &free_space) {
-        clock_t t0, t1, t2, t3, t4;
-        t0 = clock();
-        float pixel_size = 0.2, delta_d_in_r = 0.13, delta_r = 0.15;
+
+        //generate map
+        auto start0 = std::chrono::high_resolution_clock::now();
+        float pixel_size = 0.3, delta_d_in_r = 0.13, delta_r = 0.15;
         //delta_d_in_r is smaller than pixel_size and delta_r, to make sure all pixels are covered
         Eigen::MatrixXi src = Eigen::MatrixXi::Zero(100 / pixel_size, 100 / pixel_size), dst = Eigen::MatrixXi::Zero(
             100 / pixel_size, 100 / pixel_size);
@@ -412,8 +407,9 @@ private:
             }
         }
 
-        t1 = clock();
-        for (int i = 0; i < 360; i++) {
+        // calculate freespace?
+        auto start1 = std::chrono::high_resolution_clock::now();
+        for (int i = 135; i < 224; i++) {
             for (float j = 0; j < 49; j += delta_r) {
                 float x = j * cos((i - 180) * FREE_PI / 180.0);
                 float y = j * sin((i - 180) * FREE_PI / 180.0);
@@ -438,9 +434,8 @@ private:
             }
         }
 
-
-        t2 = clock();
-
+        // freeSpace generation
+        auto start2 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < dst.rows(); i++) {
             for (int j = 0; j < dst.cols(); j++) {
                 if (dst(i, j) > 0) {
@@ -452,9 +447,12 @@ private:
                 }
             }
         }
-        t3 = clock();
-        // printf("filter time: %f, generate map: %f, conv: %f, fs generate: %f\n\n", 1000.0*(t3 - t0) / CLOCKS_PER_SEC,
-        //         1000.0*(t1 - t0) / CLOCKS_PER_SEC, 1000.0*(t2 - t1) / CLOCKS_PER_SEC, 1000.0*(t3 - t2) / CLOCKS_PER_SEC);
+
+        auto start3 = std::chrono::high_resolution_clock::now();
+        double duration0 = std::chrono::duration_cast<std::chrono::milliseconds>(start1 - start0).count() / 1000.0;
+        double duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(start2 - start1).count() / 1000.0;
+        double duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(start3 - start2).count() / 1000.0;
+        printf("generate map: %f, calculate freespace?: %f, freeSpace generation: %f\n\n", duration0, duration1, duration2);
     }
 
     void FreeSpace(float *fPoints, int n, float *free_space, int free_space_n) {
@@ -466,7 +464,7 @@ private:
         }
 
         for (int pid = 0; pid < n; pid++) {
-            if (fPoints[pid * 4 + 2] < 3) // points of high tree, buildings are rejected
+            if (fPoints[pid * 4 + 2] < 2.0) // points of high tree, buildings are rejected
             {
                 if (abs(fPoints[pid * 4 + 1]) < 1.2 && abs(fPoints[pid * 4]) < 2.5) // reject the near points of robot
                     continue;
@@ -591,7 +589,6 @@ private:
             }
         }
 
-
         gnum = 0;
         for (int pid = 0; pid < pointNum; pid++) {
             if (pLabel[pid] == 1) {
@@ -601,6 +598,39 @@ private:
 
         return gnum;
     }
+
+    int filter_x[28] = {
+        -1, 0, 1, -3, -2, 2, 3, -4, 4, -4, 4, -5, 5, -5, 5, -5, 5, -1, 0, 1, -3, -2, 2, 3, -4, 4, -4, 4
+    };
+    int filter_y[28] = {
+        -5, -5, -5, -4, -4, -4, -4, -3, -3, -2, -2, -1, -1, 0, 0, 1, 1, 5, 5, 5, 4, 4, 4, 4, 3, 3, 2, 2
+    };
+    int all_x[89] = {
+        -1, 0, 1,
+        -3, -2, -1, 0, 1, 2, 3,
+        -4, -3, -2, -1, 0, 1, 2, 3, 4,
+        -4, -3, -2, -1, 0, 1, 2, 3, 4,
+        -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
+        -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
+        -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
+        -1, 0, 1,
+        -3, -2 - 1, 0, 1, 2, 3,
+        -4, -3, -2, -1, 0, 1, 2, 3, 4,
+        -4, -3, -2, -1, 0, 1, 2, 3, 4
+    };
+    int all_y[89] = {
+        -5, -5, -5,
+        -4, -4, -4, -4, -4, -4, -4,
+        -3, -3, -3, -3, -3, -3, -3, -3, -3,
+        -2, -2, -2, -2, -2, -2, -2, -2, -2,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        5, 5, 5,
+        4, 4, 4, 4, 4, 4, 4,
+        3, 3, 3, 3, 3, 3, 3, 3, 3,
+        2, 2, 2, 2, 2, 2, 2, 2, 2
+    };
 };
 
 int main(int argc, char **argv) {
