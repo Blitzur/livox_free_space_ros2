@@ -19,11 +19,14 @@ find_package(pcl_ros REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(patchworkpp REQUIRED)
+
        # message_generation
 
 include_directories(
         include
         include ${PCL_INCLUDE_DIRS}
+        ${patchworkpp_INCLUDE_DIRS}
 )
 
 link_directories(
@@ -32,11 +35,12 @@ link_directories(
 
 add_executable(${PROJECT_NAME}_node src/FreeSpace_node.cpp)
 
-ament_target_dependencies(${PROJECT_NAME}_node rclcpp PCL pcl_conversions pcl_ros std_msgs visualization_msgs nav_msgs sensor_msgs geometry_msgs tf2_ros)
+ament_target_dependencies(${PROJECT_NAME}_node rclcpp patchworkpp PCL pcl_conversions pcl_ros std_msgs visualization_msgs nav_msgs sensor_msgs geometry_msgs tf2_ros)
 
 target_link_libraries(
         ${PROJECT_NAME}_node
         ${PCL_LIBRARIES}
+        /usr/local/lib/libground_seg_cores.a
         dl -lboost_system
 )
 
